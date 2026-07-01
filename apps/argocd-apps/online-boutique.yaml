@@ -21,3 +21,12 @@ spec:
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+
+  # GKE Autopilot's admission webhook mutates container resource requests/limits
+  # (adds ephemeral-storage, normalizes memory) to meet its own minimums, which
+  # otherwise shows as permanent drift against the manifests in git.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/template/spec/containers/0/resources
