@@ -1,0 +1,131 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: grafana
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: grafana
+    targetRevision: 10.5.15
+    helm:
+      values: |
+        # No PVC: a PersistentVolumeClaim would consume more of the
+        # free-tier project's scarce regional SSD quota (already at its
+        # 2-node ceiling). Dashboards/datasources are provisioned from
+        # ConfigMaps below instead, so nothing is lost on pod restart.
+        persistence:
+          enabled: false
+
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+
+        admin:
+          existingSecret: ""
+
+        datasources:
+          datasources.yaml:
+            apiVersion: 1
+            datasources:
+              - name: Managed Prometheus
+                type: prometheus
+                access: proxy
+                url: http://frontend.gmp-public.svc.cluster.local:9090
+                isDefault: true
+                jsonData:
+                  httpMethod: POST
+
+        sidecar:
+          dashboards:
+            enabled: true
+            label: grafana_dashboard
+          resources:
+            requests:
+              cpu: 20m
+              memory: 48Mi
+            limits:
+              cpu: 50m
+              memory: 96Mi
+
+        dashboardProviders:
+          dashboardproviders.yaml:
+            apiVersion: 1
+            providers:
+              - name: default
+                orgId: 1
+                folder: ""
+                type: file
+                disableDeletion: false
+                editable: true
+                options:
+                  path: /var/lib/grafana/dashboards/default
+
+        dashboards:
+          default:
+            golden-signals:
+              json: |
+                {
+                  "title": "Online Boutique Golden Signals",
+                  "uid": "golden-signals",
+                  "schemaVersion": 39,
+                  "version": 1,
+                  "editable": true,
+                  "time": { "from": "now-1h", "to": "now" },
+                  "refresh": "30s",
+                  "panels": [
+                    {
+                      "id": 1,
+                      "title": "Frontend Availability (probe_success)",
+                      "type": "timeseries",
+                      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+                      "targets": [
+                        { "expr": "probe_success", "legendFormat": "success" }
+                      ]
+                    },
+                    {
+                      "id": 2,
+                      "title": "Frontend Latency (probe_duration_seconds)",
+                      "type": "timeseries",
+                      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+                      "targets": [
+                        { "expr": "probe_duration_seconds", "legendFormat": "latency" }
+                      ]
+                    },
+                    {
+                      "id": 3,
+                      "title": "HTTP Status Code",
+                      "type": "timeseries",
+                      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+                      "targets": [
+                        { "expr": "probe_http_status_code", "legendFormat": "status" }
+                      ]
+                    },
+                    {
+                      "id": 4,
+                      "title": "DNS Lookup Time",
+                      "type": "timeseries",
+                      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+                      "targets": [
+                        { "expr": "probe_dns_lookup_time_seconds", "legendFormat": "dns" }
+                      ]
+                    }
+                  ]
+                }
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

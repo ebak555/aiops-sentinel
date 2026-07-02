@@ -25,9 +25,9 @@ the agent mutating the cluster directly.
         ┌───────────────────────────────────────────────────┐
         │  Observability plane                                │
         │  Managed Prometheus + Grafana | Cloud Logging       │
-        │  OpenTelemetry Collector | Cloud Trace              │
+        │  Blackbox synthetic prober (golden signals)          │
         └───────────────┬─────────────────────────────────────┘
-                         │ alerts (Alertmanager) + raw signals
+                         │ Cloud Monitoring alert policies (PromQL)
                          ▼
         ┌───────────────────────────────────────────────────┐
         │  Detection & correlation layer                      │
@@ -72,8 +72,10 @@ postmortem for each one.
 | IaC | Terraform |
 | Compute | GKE Autopilot |
 | Observability | Google Cloud Managed Service for Prometheus + Grafana |
+| Synthetic monitoring | blackbox_exporter (probes the demo app for real golden-signal data) |
+| Alerting | Cloud Monitoring alert policies (native PromQL conditions, no extra pods) |
 | Logs | Cloud Logging |
-| Tracing | OpenTelemetry Collector → Cloud Trace |
+| Tracing | OpenTelemetry Collector → Cloud Trace (planned — no app spans to collect yet) |
 | Vector store | pgvector (Cloud SQL) / Chroma |
 | Agent runtime | Claude Agent SDK + MCP servers |
 | CI/CD | GitHub Actions + ArgoCD |
@@ -87,11 +89,20 @@ Built on GCP free-tier credit. GKE Autopilot and Cloud SQL are the only
 metered pieces; the cluster is destroyed (`terraform destroy`) between work
 sessions rather than left running. See `infra/` for the exact footprint.
 
+Free-trial GCP projects carry a **250GB regional SSD quota**, and self-service
+increases are denied until the account graduates from trial — with GKE
+Autopilot's default 100GB-per-node boot disk, that's a hard 2-node ceiling.
+Self-hosted components that would add a 3rd node (extra ArgoCD components,
+a self-hosted Alertmanager) were traded for lighter-weight equivalents
+(disabling ArgoCD's unused `dex-server`, using Cloud Monitoring's native
+PromQL alert policies instead of a self-hosted Alertmanager) to stay within
+that ceiling rather than requesting a quota increase.
+
 ## Repo layout
 
 ```
-infra/    Terraform: VPC, GKE Autopilot, Artifact Registry, ArgoCD bootstrap
-apps/     Kubernetes manifests for the demo workload + observability stack
+infra/    Terraform: VPC, GKE Autopilot, Artifact Registry, ArgoCD bootstrap, alert policies
+apps/     Kubernetes manifests + ArgoCD Applications for the demo workload and observability stack
 agent/    AI Ops Agent, MCP tool servers, runbook corpus
 ```
 
@@ -107,4 +118,4 @@ agent/    AI Ops Agent, MCP tool servers, runbook corpus
 7. Chaos + demo loop — fault injection, end-to-end recording, auto postmortems
 8. Polish — architecture diagram, cost/metrics writeup, demo video
 
-Status: **Phase 0 done.** Building Phase 1 next.
+Status: **Phase 0-2 done.** Building Phase 3 next.
