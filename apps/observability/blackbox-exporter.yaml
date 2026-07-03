@@ -30,7 +30,7 @@ spec:
               memory: 32Mi
             limits:
               cpu: 50m
-              memory: 64Mi
+              memory: 96Mi
           livenessProbe:
             httpGet:
               path: /-/healthy
