@@ -20,3 +20,12 @@ spec:
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+
+  # Same GKE Autopilot resource-mutation drift as online-boutique.yaml
+  # (see Phase 1 notes) -- Autopilot adjusts container resource
+  # requests/limits, which otherwise shows as permanent drift.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/template/spec/containers/0/resources

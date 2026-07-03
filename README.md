@@ -13,6 +13,11 @@ correlated, diagnosed by an LLM agent with real tool access (metrics, logs,
 runbooks), and remediated through a policy-gated GitOps pipeline — never by
 the agent mutating the cluster directly.
 
+**Want to build this yourself, step by step?** See
+**[BUILD_GUIDE.md](BUILD_GUIDE.md)** — a full phase-by-phase walkthrough
+written for a junior AIOps/platform engineer, with real commands and the
+actual bugs hit building this the first time, not just the happy path.
+
 ## Architecture
 
 ```
@@ -53,23 +58,29 @@ the agent mutating the cluster directly.
                          │ proposed action (a PR, or none)
                          ▼
         ┌───────────────────────────────────────────────────┐
-        │  Guardrail / policy layer                            │
-        │  OPA/Gatekeeper: auto-approve safe actions (restart   │
-        │  pod, bounded scale); require Slack sign-off for       │
-        │  anything riskier (rollback, resource-limit changes)  │
+        │  Guardrail / policy layer (GitHub Actions)            │
+        │  OPA via conftest — not Gatekeeper: this gates a       │
+        │  proposed file diff in a PR, not a live K8s admission  │
+        │  request, so the CI-testing flavor of OPA fits, not     │
+        │  the cluster-admission-controller flavor.               │
+        │  Auto-merges PRs within bounds tied to this project's   │
+        │  real capacity limit (CPU/memory/replica caps, allowed   │
+        │  file paths); anything else blocks merge + notifies      │
+        │  Slack for human review.                                 │
         └───────────────┬─────────────────────────────────────┘
                          │ approved action
                          ▼
         ┌───────────────────────────────────────────────────┐
         │  Execution: GitOps, not direct mutation              │
-        │  Agent opens a PR → GitHub Actions CI → ArgoCD        │
-        │  syncs the change to GKE                              │
+        │  Agent opens a PR → policy gate auto-merges or         │
+        │  escalates → ArgoCD syncs the change to GKE             │
         └───────────────────────────────────────────────────┘
 ```
 
-Chaos Mesh injects failures into the demo workload on a schedule so the loop
-has real incidents to diagnose and fix, and the agent auto-writes a
-postmortem for each one.
+Lightweight `kubectl`-based fault-injection scripts (`chaos/`) simulate real
+failures (bad deploy, full outage, CPU starvation) so the loop has real
+incidents to detect and diagnose, and the agent commits a postmortem
+directly to `postmortems/` for each one it investigates.
 
 ## Tool stack
 
@@ -90,9 +101,10 @@ postmortem for each one.
 | Agent secrets | Secret Manager (Anthropic API key, GitHub token) mounted directly into Cloud Run |
 | Agent cluster access | IAM-mapped Kubernetes RBAC — no VPC connector, no kubeconfig |
 | CI/CD | GitHub Actions + ArgoCD |
-| Chaos engineering | Chaos Mesh |
-| Policy | OPA / Gatekeeper |
-| ChatOps | Slack API |
+| Chaos engineering | `kubectl`-based fault injection scripts (`chaos/`) — no Chaos Mesh, see Cost discipline |
+| Policy | OPA via `conftest`, evaluated in GitHub Actions on the agent's PRs |
+| ChatOps | Slack Incoming Webhook (notification only, no interactive approval UI) |
+| Postmortems | Agent commits directly to `postmortems/` on `main` — pure documentation, no policy gate |
 
 ## Results so far
 
@@ -134,6 +146,40 @@ The GitHub PR tool was verified separately with a direct, isolated call
 confirming the credential and API integration work correctly for the case
 where the agent does have a concrete fix to propose.
 
+**A real incident, on the project itself:** the Anthropic account backing
+the agent ran out of credit, and every subsequent `/investigate` call
+failed instantly with a billing error. Because the Pub/Sub subscription
+feeding the agent had no delivery-attempt limit, Pub/Sub redelivered the
+same stuck message every few seconds, indefinitely — of 2,830 requests to
+the agent in 24 hours, only 24 ever succeeded. The failed retries cost
+nothing further (Claude rejects the request before spending tokens once
+credit is gone), but the real damage was already done by the 24 completed
+investigations before that point, and the storm itself was pure waste. Fix:
+a dead-letter topic + 5-attempt cap on every push subscription in the
+project, including one on the correlator that had the identical
+unprotected gap and had simply never failed yet.
+
+**The chaos scripts immediately paid for themselves.** The first real test
+(`inject-scale-to-zero.sh`) surfaced two things a synthetic test message
+never would have: the static Cloud Monitoring alert's webhook payload
+doesn't populate `resource_display_name`/`resource_id` for PromQL-based
+conditions, so every static alert was landing in the correlator under an
+empty resource and never merging with the anomaly-detector's `frontend`
+incidents (fixed by defaulting to `frontend`, the only resource this
+project currently monitors); and the alert took **184 seconds** to fire
+despite a configured 60-second duration — real evaluation latency for
+PromQL-backed Cloud Monitoring conditions that a short synthetic test
+wouldn't reveal. The same chaos run also caught a leftover gap from Phase
+2: the `observability` ArgoCD Application (blackbox-exporter,
+gmp-frontend) was written but never actually applied to the cluster, so
+those components had been running unmanaged outside GitOps since Phase 2.
+
+**The policy gate works exactly as designed**, verified with two real PRs
+against the actual repo: an in-bounds resource change auto-merged with no
+human involved (`mergedBy: github-actions[bot]`); a change violating the
+1Gi memory cap was blocked and left a review-request comment, never
+merging.
+
 ## Cost discipline
 
 Built on GCP free-tier credit. GKE Autopilot and Cloud SQL are the only
@@ -154,15 +200,29 @@ rather than as more in-cluster pods, for the same reason: they scale to
 zero, cost nothing at rest, and don't compete for the cluster's 2-node
 budget at all.
 
+Phase 7 deliberately skips deploying Chaos Mesh for the same reason —
+its controller stack would add real, permanent resource pressure to a
+2-node cluster this project has spent multiple phases fighting to keep
+under budget, for a demo that only needs a handful of specific failure
+modes. Lightweight `kubectl`-based scripts (`chaos/`) cost nothing to run
+and revert cleanly. Separately, every Pub/Sub push subscription now has a
+dead-letter policy after a real incident (see Results) where a missing
+one turned 56 real incidents into 2,830 requests and burned through the
+project's Anthropic API credit.
+
 ## Repo layout
 
 ```
-infra/     Terraform: VPC, GKE Autopilot, Artifact Registry, ArgoCD bootstrap, alert policies,
-           Pub/Sub, Cloud Run services, Firestore
-apps/      Kubernetes manifests + ArgoCD Applications for the demo workload and observability stack
-services/  Cloud Run source: alert-receiver, anomaly-detector, correlator
-agent/     Runbook corpus (agent/runbooks/), ingestion script, runbook-mcp-server (Cloud Run),
-           and ops-agent (Cloud Run) -- the AI Ops Agent itself
+infra/               Terraform: VPC, GKE Autopilot, Artifact Registry, ArgoCD bootstrap, alert
+                     policies, Pub/Sub (with dead-letter policies), Cloud Run services, Firestore
+apps/                Kubernetes manifests + ArgoCD Applications for the demo workload and
+                     observability stack
+services/            Cloud Run source: alert-receiver, anomaly-detector, correlator
+agent/               Runbook corpus (agent/runbooks/), ingestion script, runbook-mcp-server
+                     (Cloud Run), and ops-agent (Cloud Run) -- the AI Ops Agent itself
+policy/              OPA/Rego policy the GitHub Actions gate evaluates against the agent's PRs
+chaos/               kubectl-based fault-injection scripts + their reverts
+.github/workflows/   The policy-gate workflow (auto-merge safe PRs, block + notify risky ones)
 ```
 
 ## Phases
@@ -173,8 +233,8 @@ agent/     Runbook corpus (agent/runbooks/), ingestion script, runbook-mcp-serve
 3. Detection & correlation — alert-receiver, statistical anomaly detector, correlator (Cloud Run + Pub/Sub + Firestore)
 4. Runbook RAG — 9-runbook corpus, Vertex AI embeddings, Firestore vector search, retrieval MCP server (Cloud Run)
 5. AI Ops Agent — Claude Agent SDK agent (Cloud Run) with metrics/K8s/runbook/GitHub tools, triggered by Pub/Sub
-6. Guardrails & execution — OPA policy, Slack approval, GitOps-only remediation
-7. Chaos + demo loop — fault injection, end-to-end recording, auto postmortems
+6. Guardrails & execution — OPA-via-conftest policy gate (GitHub Actions), Slack notification, auto-merge safe / block risky
+7. Chaos + demo loop — kubectl-based fault injection, auto postmortems committed to `postmortems/`
 8. Polish — architecture diagram, cost/metrics writeup, demo video
 
-Status: **Phase 0-5 done.** Building Phase 6 next.
+Status: **Phase 0-7 done.** Building Phase 8 next.
