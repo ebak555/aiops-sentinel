@@ -1,0 +1,91 @@
+name: Remediation Policy Gate
+
+# Gates PRs opened by the AI Ops Agent (agent/ops-agent) against an OPA
+# policy (policy/remediation.rego) before allowing them to merge. This is
+# the "guardrail" layer: the agent can only ever propose a change via PR
+# (see Phase 5), never merge one directly -- this workflow is what decides
+# whether a proposal is safe enough to auto-merge or needs a human.
+#
+# Uses conftest (OPA for config/CI, not Gatekeeper) since this gates a
+# proposed file diff in a PR, not a live Kubernetes admission request --
+# Gatekeeper polices the latter and doesn't fit this flow.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  policy-gate:
+    if: startsWith(github.event.pull_request.title, '[ops-agent]')
+    runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check changed files are within the allowed paths
+        id: paths
+        run: |
+          CHANGED=$(git diff --name-only origin/main...HEAD)
+          echo "Changed files:"
+          echo "$CHANGED"
+          DISALLOWED=$(echo "$CHANGED" | grep -vE '^apps/(online-boutique|observability)/' || true)
+          if [ -n "$DISALLOWED" ]; then
+            echo "disallowed=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Changed files outside the allowed paths: $DISALLOWED"
+          else
+            echo "disallowed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install conftest
+        if: steps.paths.outputs.disallowed == 'false'
+        run: |
+          curl -L -s -o conftest.tar.gz https://github.com/open-policy-agent/conftest/releases/download/v0.68.2/conftest_0.68.2_Linux_x86_64.tar.gz
+          tar xzf conftest.tar.gz conftest
+          sudo mv conftest /usr/local/bin
+
+      - name: Run policy checks
+        if: steps.paths.outputs.disallowed == 'false'
+        id: policy
+        run: |
+          CHANGED=$(git diff --name-only origin/main...HEAD -- 'apps/online-boutique/*.yaml' 'apps/observability/*.yaml')
+          if [ -z "$CHANGED" ]; then
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if conftest test $CHANGED -p policy/; then
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Auto-merge safe PR
+        if: steps.paths.outputs.disallowed == 'false' && steps.policy.outputs.result == 'pass'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr merge "${{ github.event.pull_request.number }}" --squash
+
+      - name: Notify Slack for anything requiring human review
+        if: >
+          (steps.paths.outputs.disallowed == 'true' || steps.policy.outputs.result == 'fail') &&
+          env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":rotating_light: AIOps agent PR needs human review: ${{ github.event.pull_request.html_url }}\nReason: policy check failed or touched disallowed paths.\"}" \
+            "$SLACK_WEBHOOK_URL"
+
+      - name: Leave a comment when Slack isn't configured
+        if: >
+          (steps.paths.outputs.disallowed == 'true' || steps.policy.outputs.result == 'fail') &&
+          env.SLACK_WEBHOOK_URL == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" --body \
+            ":rotating_light: This PR requires human review (policy check failed or touched disallowed paths). Slack notifications aren't configured (SLACK_WEBHOOK_URL secret unset)."

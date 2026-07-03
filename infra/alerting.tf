@@ -10,6 +10,24 @@
 # quota only fits 2 nodes and both are already near capacity — this adds
 # zero extra pods.
 
+# Cloud Monitoring's webhook_basicauth channel type POSTs the alert JSON
+# payload to `url` using HTTP Basic Auth, which matches how the Cloud Run
+# alert-receiver service (services/alert-receiver) authenticates requests.
+resource "google_monitoring_notification_channel" "alert_receiver" {
+  project      = var.project_id
+  display_name = "AIOps Sentinel alert receiver (Cloud Run)"
+  type         = "webhook_basicauth"
+
+  labels = {
+    url      = "${google_cloud_run_v2_service.alert_receiver.uri}/webhook"
+    username = "aiops"
+  }
+
+  sensitive_labels {
+    password = random_password.alert_webhook_password.result
+  }
+}
+
 resource "google_monitoring_alert_policy" "frontend_probe_failed" {
   project      = var.project_id
   display_name = "AIOps Sentinel: frontend probe failing"
@@ -22,6 +40,8 @@ resource "google_monitoring_alert_policy" "frontend_probe_failed" {
       duration = "60s"
     }
   }
+
+  notification_channels = [google_monitoring_notification_channel.alert_receiver.id]
 
   alert_strategy {
     auto_close = "1800s"
@@ -41,6 +61,8 @@ resource "google_monitoring_alert_policy" "frontend_latency_high" {
     }
   }
 
+  notification_channels = [google_monitoring_notification_channel.alert_receiver.id]
+
   alert_strategy {
     auto_close = "1800s"
   }
@@ -58,6 +80,8 @@ resource "google_monitoring_alert_policy" "frontend_non_200" {
       duration = "60s"
     }
   }
+
+  notification_channels = [google_monitoring_notification_channel.alert_receiver.id]
 
   alert_strategy {
     auto_close = "1800s"
